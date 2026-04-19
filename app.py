@@ -1,9 +1,8 @@
 """
 app.py
 ======
-Interface Streamlit — Simulation pas-à-pas du carrefour.
-
-Lancement : streamlit run app.py
+Interface Streamlit — Simulation pas-à-pas + comparaison des 3 stratégies.
+Compatible Streamlit Cloud : entraîne automatiquement si q_table.npy absent.
 """
 
 import streamlit as st
@@ -11,7 +10,6 @@ import numpy as np
 import pandas as pd
 import os
 import sys
-import time
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -28,7 +26,80 @@ st.set_page_config(
 )
 
 st.title("🚦 Simulation pas-à-pas du carrefour")
-st.caption("Observez le comportement du feu step par step selon la stratégie choisie.")
+st.caption("Comparez Q-Learning, Fixed-Time et Greedy en temps réel.")
+
+PHASE_LABEL  = {0: "🟢 NS  /  🔴 EO", 1: "🔴 NS  /  🟢 EO"}
+ACTION_LABEL = {0: "GARDER", 1: "CHANGER"}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Auto-entraînement si q_table.npy absent (Streamlit Cloud)
+# ─────────────────────────────────────────────────────────────────────────────
+def auto_train():
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    q_path = os.path.join(RESULTS_DIR, "q_table.npy")
+    if os.path.exists(q_path):
+        return
+
+    with st.spinner("Première utilisation — entraînement de l'agent en cours... (≈ 10s)"):
+        import json
+        env   = TrafficIntersection(lambda_ns=0.5, lambda_eo=0.4)
+        agent = QLearningAgent(
+            state_space_size=env.state_space_size,
+            alpha=0.1, gamma=0.95,
+            epsilon_start=1.0, epsilon_end=0.01, epsilon_decay=0.995,
+        )
+        fixed  = FixedTimeBaseline(interval=5)
+        greedy = GreedyBaseline()
+
+        ql_r, ft_r, gr_r, eps_trace = [], [], [], []
+        np.random.seed(42)
+
+        for ep in range(1000):
+            # Q-Learning
+            state = env.reset()
+            r_ql  = 0
+            for _ in range(100):
+                a = agent.choose_action(state)
+                ns, r = env.step(a)
+                agent.update(state, a, r, ns)
+                state = ns
+                r_ql += r
+            agent.decay_epsilon()
+
+            # Fixed
+            state = env.reset(); fixed.reset()
+            r_ft = 0
+            for _ in range(100):
+                a = fixed.choose_action(state)
+                state, r = env.step(a)
+                r_ft += r
+
+            # Greedy
+            state = env.reset()
+            r_gr = 0
+            for _ in range(100):
+                a = greedy.choose_action(state)
+                state, r = env.step(a)
+                r_gr += r
+
+            ql_r.append(r_ql); ft_r.append(r_ft); gr_r.append(r_gr)
+            eps_trace.append(agent.epsilon)
+
+        np.save(q_path, agent.Q)
+        data = {
+            "config": {"lambda_ns": 0.5, "lambda_eo": 0.4,
+                       "max_queue": 3, "green_flow": 1, "fixed_interval": 5},
+            "ql_rewards": ql_r, "fixed_rewards": ft_r,
+            "greedy_rewards": gr_r, "epsilon_trace": eps_trace,
+            "ql_eval_rewards": [],
+        }
+        with open(os.path.join(RESULTS_DIR, "training_data.json"), "w") as f:
+            json.dump(data, f)
+
+    st.success("✅ Agent entraîné et prêt !")
+    st.rerun()
+
+auto_train()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Sidebar
@@ -36,169 +107,157 @@ st.caption("Observez le comportement du feu step par step selon la stratégie ch
 with st.sidebar:
     st.header("Configuration")
 
-    strat = st.radio(
-        "Stratégie",
-        ["Q-Learning", "Fixed-Time", "Greedy"],
-        help="Q-Learning nécessite un entraînement préalable (run_all.py).",
-    )
+    st.subheader("Stratégies à simuler")
+    use_ql = st.checkbox("Q-Learning",  value=True)
+    use_ft = st.checkbox("Fixed-Time",  value=True)
+    use_gr = st.checkbox("Greedy",      value=True)
 
     st.divider()
     st.subheader("Environnement")
     lambda_ns = st.slider("λ NS (arrivées/step)", 0.1, 1.5, 0.5, 0.1)
     lambda_eo = st.slider("λ EO (arrivées/step)", 0.1, 1.5, 0.4, 0.1)
-    fixed_int = st.slider("Intervalle fixed-time (steps)", 2, 20, 5,
-                          disabled=(strat != "Fixed-Time"))
+    fixed_int = st.slider("Intervalle fixed-time", 2, 20, 5)
 
     st.divider()
     n_steps = st.slider("Nombre de steps", 10, 300, 80)
-    speed   = st.slider("Vitesse (s/step)", 0.0, 0.5, 0.05, 0.01,
-                        help="0 = instantané")
+    seed    = st.number_input("Seed", value=42, step=1)
 
-    run_btn = st.button("▶ Lancer la simulation", type="primary", use_container_width=True)
+    run_btn = st.button("▶ Lancer la comparaison", type="primary", use_container_width=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
-PHASE_LABEL  = {0: "🟢 NS  /  🔴 EO", 1: "🔴 NS  /  🟢 EO"}
-ACTION_LABEL = {0: "GARDER", 1: "CHANGER"}
-
-def load_agent():
-    q_path = os.path.join(RESULTS_DIR, "q_table.npy")
-    if not os.path.exists(q_path):
-        return None
+def run_strategy(name, policy_fn, seed):
+    np.random.seed(seed)
     env   = TrafficIntersection(lambda_ns=lambda_ns, lambda_eo=lambda_eo)
-    agent = QLearningAgent(state_space_size=env.state_space_size)
+    state = env.reset()
+    rows  = []
+    total = 0.0
+    for step in range(1, n_steps + 1):
+        action          = policy_fn(state)
+        next_state, rew = env.step(action)
+        total          += rew
+        rows.append({
+            "Step":          step,
+            "NS en attente": next_state[0],
+            "EO en attente": next_state[1],
+            "Total attente": next_state[0] + next_state[1],
+            "Action":        ACTION_LABEL[action],
+            "Phase":         PHASE_LABEL[next_state[2]],
+            "Récompense":    rew,
+            "Cumul":         round(total, 0),
+        })
+        state = next_state
+    return pd.DataFrame(rows)
+
+
+def load_ql_policy():
+    q_path = os.path.join(RESULTS_DIR, "q_table.npy")
+    env    = TrafficIntersection(lambda_ns=lambda_ns, lambda_eo=lambda_eo)
+    agent  = QLearningAgent(state_space_size=env.state_space_size)
     agent.load(q_path)
     agent.epsilon = 0.0
-    return agent
-
-def get_strategy():
-    if strat == "Q-Learning":
-        agent = load_agent()
-        if agent is None:
-            st.error("Table Q introuvable. Lancez d'abord `python run_all.py`.")
-            st.stop()
-        return lambda s: agent.choose_action(s, greedy=True)
-    elif strat == "Fixed-Time":
-        bl = FixedTimeBaseline(interval=fixed_int)
-        return bl.choose_action
-    else:
-        bl = GreedyBaseline()
-        return bl.choose_action
+    return lambda s: agent.choose_action(s, greedy=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Simulation
 # ─────────────────────────────────────────────────────────────────────────────
 if run_btn:
-    env    = TrafficIntersection(lambda_ns=lambda_ns, lambda_eo=lambda_eo)
-    policy = get_strategy()
-    state  = env.reset()
+    if not (use_ql or use_ft or use_gr):
+        st.warning("Sélectionne au moins une stratégie.")
+        st.stop()
 
-    st.subheader("État du carrefour en temps réel")
-    col_phase, col_ns, col_eo, col_total, col_reward = st.columns(5)
-    ph_box  = col_phase.empty()
-    ns_box  = col_ns.empty()
-    eo_box  = col_eo.empty()
-    tot_box = col_total.empty()
-    rew_box = col_reward.empty()
+    results = {}
+
+    if use_ql:
+        results["Q-Learning"] = run_strategy("Q-Learning", load_ql_policy(), seed)
+    if use_ft:
+        bl = FixedTimeBaseline(interval=fixed_int)
+        results["Fixed-Time"] = run_strategy("Fixed-Time", bl.choose_action, seed)
+    if use_gr:
+        bl = GreedyBaseline()
+        results["Greedy"] = run_strategy("Greedy", bl.choose_action, seed)
+
+    COLORS = {
+        "Q-Learning": "#1D9E75",
+        "Fixed-Time": "#D85A30",
+        "Greedy":     "#185FA5",
+    }
+
+    st.subheader("Résumé comparatif")
+    cols = st.columns(len(results))
+    for col, (name, df) in zip(cols, results.items()):
+        col.metric(f"{name}", f"{df['Cumul'].iloc[-1]:.0f}", help="Récompense cumulée")
+        col.caption(f"Attente moy : **{df['Total attente'].mean():.2f}** · Changements : **{df[df['Action']=='CHANGER'].shape[0]}**")
 
     st.divider()
-    vis_ph = st.empty()
+    st.subheader("Files d'attente totales (NS + EO)")
+    df_total = pd.DataFrame({"Step": range(1, n_steps + 1)})
+    for name, df in results.items():
+        df_total[name] = df["Total attente"].values
+    st.line_chart(df_total.set_index("Step"),
+                  color=[COLORS[n] for n in results.keys()])
 
-    st.subheader("Files d'attente au fil du temps")
-    chart_ph = st.empty()
+    st.subheader("Récompense cumulée")
+    df_cumul = pd.DataFrame({"Step": range(1, n_steps + 1)})
+    for name, df in results.items():
+        df_cumul[name] = df["Cumul"].values
+    st.line_chart(df_cumul.set_index("Step"),
+                  color=[COLORS[n] for n in results.keys()])
 
-    st.subheader("Journal des steps")
-    log_ph = st.empty()
-
-    history   = []
-    total_rew = 0.0
-
-    for step in range(1, n_steps + 1):
-        action          = policy(state)
-        next_state, rew = env.step(action)
-        ns, eo, ph      = next_state
-        total_rew      += rew
-
-        history.append({
-            "Step":          step,
-            "Phase":         PHASE_LABEL[ph],
-            "Action":        ACTION_LABEL[action],
-            "NS en attente": ns,
-            "EO en attente": eo,
-            "Récompense":    rew,
-            "Cumul":         round(total_rew, 0),
+    st.divider()
+    st.subheader("Statistiques détaillées")
+    stat_rows = []
+    for name, df in results.items():
+        stat_rows.append({
+            "Stratégie":          name,
+            "Récompense totale":  f"{df['Cumul'].iloc[-1]:.0f}",
+            "Attente moy/step":   f"{df['Total attente'].mean():.2f}",
+            "Attente max":        f"{df['Total attente'].max()}",
+            "Changements phase":  f"{df[df['Action']=='CHANGER'].shape[0]}",
+            "Steps NS=0 et EO=0": f"{((df['NS en attente']==0) & (df['EO en attente']==0)).sum()}",
         })
+    st.dataframe(pd.DataFrame(stat_rows), hide_index=True, use_container_width=True)
 
-        ph_box.metric("Phase actuelle", PHASE_LABEL[ph])
-        ns_box.metric("File NS", ns, delta=int(ns - state[0]) or None)
-        eo_box.metric("File EO", eo, delta=int(eo - state[1]) or None)
-        tot_box.metric("Total attente", ns + eo)
-        rew_box.metric("Récompense cumul", f"{total_rew:.0f}")
-
-        ns_bar = "█" * ns + "░" * (3 - ns)
-        eo_bar = "█" * eo + "░" * (3 - eo)
-        ns_col = "🟢" if ph == 0 else "🔴"
-        eo_col = "🟢" if ph == 1 else "🔴"
-
-        vis_ph.markdown(f"""
-<div style="font-family:monospace;font-size:15px;line-height:2.2;
-            padding:14px 22px;border:1px solid #ccc;
-            border-radius:8px;display:inline-block">
-  <b>Step {step}/{n_steps}</b> &nbsp;·&nbsp; Action : <b>{ACTION_LABEL[action]}</b><br>
-  {ns_col} NS &nbsp; [{ns_bar}] {ns} voiture(s)<br>
-  {eo_col} EO &nbsp; [{eo_bar}] {eo} voiture(s)
-</div>
-""", unsafe_allow_html=True)
-
-        df_hist = pd.DataFrame(history)
-        chart_ph.line_chart(
-            df_hist.set_index("Step")[["NS en attente", "EO en attente"]],
-            color=["#D85A30", "#185FA5"],
-        )
-        log_ph.dataframe(
-            df_hist.tail(20)[["Step","Phase","Action","NS en attente","EO en attente","Récompense","Cumul"]],
-            hide_index=True, use_container_width=True,
-        )
-
-        state = next_state
-        if speed > 0:
-            time.sleep(speed)
+    others = {n: d for n, d in results.items() if n != "Q-Learning"}
+    if "Q-Learning" in results and others:
+        st.divider()
+        st.subheader("Gain Q-Learning")
+        ql_r = results["Q-Learning"]["Cumul"].iloc[-1]
+        gain_cols = st.columns(len(others))
+        for i, (name, df) in enumerate(others.items()):
+            other_r = df["Cumul"].iloc[-1]
+            gain    = (ql_r - other_r) / abs(other_r) * 100
+            gain_cols[i].metric(f"vs {name}", f"{gain:+.1f}%",
+                                delta=f"{ql_r - other_r:.0f} pts")
 
     st.divider()
-    st.subheader("Résumé")
-    df_final = pd.DataFrame(history)
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Récompense totale",    f"{total_rew:.0f}")
-    c2.metric("Attente moy / step",   f"{df_final['NS en attente'].add(df_final['EO en attente']).mean():.2f}")
-    c3.metric("Changements de phase", f"{df_final[df_final['Action']=='CHANGER'].shape[0]}")
-    c4.metric("Steps simulés",        n_steps)
-
-    st.download_button(
-        "⬇ Télécharger le journal (CSV)",
-        data=df_final.to_csv(index=False).encode(),
-        file_name=f"simulation_{strat.lower().replace('-','_')}.csv",
-        mime="text/csv",
-    )
+    st.subheader("Journaux détaillés")
+    tabs = st.tabs(list(results.keys()))
+    for tab, (name, df) in zip(tabs, results.items()):
+        with tab:
+            st.dataframe(
+                df[["Step","Phase","Action","NS en attente","EO en attente","Récompense","Cumul"]],
+                hide_index=True, use_container_width=True, height=300,
+            )
+            st.download_button(
+                f"⬇ Télécharger {name} (CSV)",
+                data=df.to_csv(index=False).encode(),
+                file_name=f"sim_{name.lower().replace('-','_').replace(' ','_')}.csv",
+                mime="text/csv",
+                key=f"dl_{name}",
+            )
 
 else:
-    st.info("Configure les paramètres dans la barre latérale, puis clique sur **▶ Lancer la simulation**.")
-
-    with st.expander("Comment ça marche ?"):
+    st.info("Sélectionne les stratégies dans la barre latérale, puis clique sur **▶ Lancer la comparaison**.")
+    with st.expander("Comment lire les résultats ?"):
         st.markdown("""
-**3 stratégies disponibles :**
-
-| Stratégie | Description |
+| Indicateur | Signification |
 |---|---|
-| **Q-Learning** | Agent entraîné — choisit l'action qui maximise la récompense future estimée |
-| **Fixed-Time** | Change le feu toutes les N steps, sans regarder les files |
-| **Greedy** | Donne toujours le vert à la file la plus longue (myope) |
+| **Récompense cumulée** | Somme des `-(NS+EO)` — plus c'est proche de 0, mieux c'est |
+| **Attente moy/step** | Nombre moyen de voitures en attente à chaque instant |
+| **Changements de phase** | Nombre de fois où le feu a basculé |
+| **Steps NS=0 et EO=0** | Steps où les deux files étaient vides (idéal) |
 
-**Lecture du carrefour :**
-- 🟢 = feu vert (voitures passent)
-- 🔴 = feu rouge (voitures attendent)
-- `████` = 3 voitures (maximum)
-- `░░░░` = file vide
-
-**Reward :** `-(NS + EO)` — plus c'est proche de 0, mieux c'est.
+> Toutes les stratégies sont simulées avec la **même seed** pour une comparaison équitable.
         """)
