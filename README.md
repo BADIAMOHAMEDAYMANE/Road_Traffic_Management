@@ -130,6 +130,26 @@ python3 evaluate.py
 
 ---
 
+## 🐳 Utilisation avec Docker
+
+Le projet inclut une configuration Docker (via `docker-compose.yml`) pour simplifier l'exécution sans gestion locale des dépendances.
+
+### 1. Lancer l'interface Streamlit
+Pour démarrer l'application web (accessible sur [http://localhost:8501](http://localhost:8501)) :
+```bash
+docker-compose --profile app up -d --build
+```
+*Pour arrêter le conteneur : `docker-compose --profile app down`*
+
+### 2. Lancer l'entraînement
+Pour exécuter l'entraînement complet (`run_all.py`) de manière isolée :
+```bash
+docker-compose --profile train up --build
+```
+*(Les fichiers générés comme `q_table.npy` seront synchronisés automatiquement dans le dossier local `results/` via les volumes).*
+
+---
+
 ## 📊 Résultats
 
 Résultats obtenus après 1000 épisodes (100 steps/épisode) :
